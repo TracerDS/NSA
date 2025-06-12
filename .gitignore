@@ -1,0 +1,9 @@
+/bin
+/build
+/.vscode
+
+/*.o
+/*.exe
+/*.dll
+/*.so
+
