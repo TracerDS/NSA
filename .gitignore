@@ -1,9 +1,12 @@
-/bin
-/build
-/.vscode
+# Ignore everything
+*
 
-/*.o
-/*.exe
-/*.dll
-/*.so
+# Except git files
+!.gitignore
 
+# Except source files
+!**.hpp
+!**.cpp
+
+# Except build files
+!**.lua
