@@ -1,5 +1,5 @@
 project 'Shared'
-    kind 'None'
+    kind 'Utility'
     
     files { 'Shared/**.hpp', }
     vpaths {

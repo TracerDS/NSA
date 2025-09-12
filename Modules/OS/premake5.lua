@@ -1,10 +1,10 @@
-local PROJECT_NAME = 'OS_Module'
+local PROJECT_NAME = 'OS'
 
 project ( PROJECT_NAME )
     kind 'SharedLib'
-    targetdir (ROOT_PATH_JOIN('bin/'..COMMON_PATH))
-    objdir (ROOT_PATH_JOIN('!build/obj/$(ProjectName)/'..COMMON_PATH))
-    
+    targetdir (ROOT_PATH_JOIN('bin/'..path.join(COMMON_PATH, 'Modules')))
+    objdir (ROOT_PATH_JOIN('!build/obj/$(ProjectName)/'..path.join(COMMON_PATH, 'Modules')))
+
     includedirs { 'hpp' }
     files {
         'hpp/**.hpp',
@@ -14,4 +14,9 @@ project ( PROJECT_NAME )
     vpaths {
         ["Header Files"] = { 'hpp/**.hpp' },
         ["Source Files"] = { 'src/**.cpp' }
+    }
+
+    defines {
+        'NSA_EXPORT',
+        'NSA_OS_EXPORT',
     }

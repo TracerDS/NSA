@@ -1,8 +1,7 @@
 #include <Shared/path.hpp>
-#include <cstdio>
 #include <Shared/dll.hpp>
-#include <iostream>
-#include <format>
+
+#include <print>
 
 using EntryPointFunction_t = void(*)();
 
@@ -14,18 +13,20 @@ int main() {
 
     NSA::Shared::DynamicLibrary CoreLib;
     if (!CoreLib.Open(CORE_PATH.string())) {
-        std::cout << std::format("Failed to load {}: {}\n",
+        std::println(
+            stderr,
+            "Failed to load {}: {}",
             CORE_PATH.string(),
             CoreLib.GetError()
         );
-		return 1;
+        return 1;
     }
 
     auto EntryPoint = CoreLib.GetFunction<EntryPointFunction_t>("EntryPoint");
     if (!EntryPoint) {
-        std::cout << "Failed to find EntryPoint function in the module!\n";
+        std::println(stderr, "Failed to find EntryPoint function in the module!");
         return 1;
-	}
+    }
 
     EntryPoint();
     return 0;

@@ -11,7 +11,21 @@ workspace "NSA"
     cppdialect "C++latest"
     characterset "MBCS"
 
-    includedirs { 'Shared' }
+    includedirs { '.', 'Shared', 'Modules', 'Shared/include' }
+    libdirs { 'Shared/lib' }
+    links {
+        'ws2_32.lib',
+        'bcrypt.lib',
+        'secur32.lib',
+        'ole32.lib',
+        'shell32.lib',
+
+        'avcodec.lib',
+        'avformat.lib',
+        'avutil.lib',
+        'swresample.lib',
+        'swscale.lib',
+    }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -41,3 +55,4 @@ workspace "NSA"
     include 'Shared'
     group 'Modules'
         include 'Modules/OS'
+        include 'Modules/FFmpeg'

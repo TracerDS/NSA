@@ -15,3 +15,8 @@ project ( PROJECT_NAME )
         ["Header Files"] = { 'hpp/**.hpp' },
         ["Source Files"] = { 'src/**.cpp' }
     }
+    
+    defines {
+        'NSA_EXPORT',
+        'NSA_CORE_EXPORT',
+    }
