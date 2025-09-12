@@ -1,12 +1,7 @@
-# Ignore everything
-*
+# Ignore build artifacts
+bin/
+build/
 
-# Except git files
-!.gitignore
+*.py
 
-# Except source files
-!**.hpp
-!**.cpp
-
-# Except build files
-!**.lua
+Shared/lib
