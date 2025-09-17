@@ -32,6 +32,6 @@ namespace NSA::Core::Event {
     };
 
     struct event_t {
-        //virtual ~event_t() = default;
+        virtual ~event_t() = default;
     };
 }

@@ -29,22 +29,12 @@ namespace NSA::Core::Socket {
 		struct IOContext {
 			IOContext() noexcept;
 
-			WSAOVERLAPPED overlapped; 
+			OVERLAPPED overlapped; 
 			WSABUF wsabuf;
 			std::vector<char> buffer;
 			IOOperation operation = IOOperation::NONE;
 			Socket* owner = nullptr;
-			SOCKET acceptSocketForAcceptEx = INVALID_SOCKET;
 		};
-		constexpr std::string_view ToString(IOOperation op) noexcept {
-			switch (op) {
-				case IOOperation::ACCEPT:  return "ACCEPT";
-				case IOOperation::RECV:    return "RECV";
-				case IOOperation::SEND:    return "SEND";
-				case IOOperation::CONNECT: return "CONNECT";
-				default: return "NONE";
-			}
-		}
 	}
 
 	class Socket {
@@ -76,11 +66,21 @@ namespace NSA::Core::Socket {
 			AddressFamily family = AddressFamily::IPV4,
 			SocketType type = SocketType::TCP
 		) noexcept;
+
 		bool Close() noexcept;
 		bool IsOpen() const noexcept;
 
 		SockType GetSocket() const noexcept;
+		std::string_view GetHost() const noexcept { return m_host; }
+		std::uint32_t GetPort() const noexcept { return m_port; }
+
 		static std::uint64_t GetShutdownKey() noexcept { return gs_shutdownKey; }
+
+		static std::optional<std::pair<
+			std::string, std::uint32_t
+		>> GetSocketAddress(
+			SockType sock
+		) noexcept;
 
 		friend void swap(Socket& lhs, Socket& rhs) noexcept;
 	protected:
@@ -90,23 +90,20 @@ namespace NSA::Core::Socket {
 			std::uint32_t error
 		) noexcept = 0;
 
+		static void* GetWinsockFunctionPtr(SockType sock, GUID guid) noexcept;
+
 		bool AssociateIOCP() const noexcept;
-
-		static LPFN_CONNECTEX GetConnectExPtr(SOCKET sock) noexcept;
-		static LPFN_ACCEPTEX GetAcceptExPtr(SOCKET sock) noexcept;
-
-		bool PostSend(std::unique_ptr<IOCP::IOContext>& ctx, std::string_view data) noexcept;
-		bool PostRecv(std::unique_ptr<IOCP::IOContext>& ctx) noexcept;
-
 	private:
-		static void* GetWinsockFunctionPtr(SOCKET sock, GUID guid) noexcept;
 		static DWORD WINAPI IOCPWorkerThread(LPVOID param) noexcept;
 	protected:
+		constexpr static std::uint32_t MAX_PENDING_RECVS = 4;
+		static std::vector<HANDLE> gs_workers;
+
 		SockType m_socket;
-		std::vector<std::string> m_addresses;
+		std::string m_host;
+		std::uint32_t m_port;
 	private:
 		static HANDLE gs_globalIOCP;
-		static std::vector<HANDLE> gs_workers;
 		static std::mutex gs_globalMutex;
 		static std::atomic<std::uint32_t> gs_socketCount;
 		static std::atomic<bool> gs_workersRunning;
@@ -114,6 +111,8 @@ namespace NSA::Core::Socket {
 	};
 
 	class ClientSocket : public Socket {
+	public:
+		struct ClientContext : public IOCP::IOContext {};
 	public:
 		struct on_connect_t : public Event::event_t {
 			std::string_view host;
@@ -134,10 +133,7 @@ namespace NSA::Core::Socket {
 		ClientSocket(Socket::SockType&& socket) noexcept;
 
 		bool Connect(const std::string_view& host, std::uint32_t port) noexcept;
-
 		bool Send(const std::string_view& data) noexcept;
-		bool Recv(Event::Event<on_data_t> callback) noexcept;
-		bool Recv() noexcept;
 
 		Event::Event<on_connect_t> OnConnect;
 		Event::Event<on_data_t> OnData;
@@ -148,10 +144,18 @@ namespace NSA::Core::Socket {
 			std::uint32_t error
 		) noexcept override;
 	private:
-		std::vector<std::unique_ptr<IOCP::IOContext>> m_postedCtx;
+		static LPFN_CONNECTEX GetConnectExPtr(SockType sock) noexcept;
+
+		bool Recv() noexcept;
+	private:
+		std::vector<std::unique_ptr<ClientContext>> m_postedCtx;
 	};
 
 	class ServerSocket : public Socket {
+	public:
+		struct ServerContext : public IOCP::IOContext {
+			ClientSocket* client;
+		};
 	public:
 		struct on_listening_t : public Event::event_t {
 			std::string_view host;
@@ -160,14 +164,45 @@ namespace NSA::Core::Socket {
 			constexpr on_listening_t(std::string_view host, std::uint32_t port)
 				noexcept : host(host), port(port) {}
 		};
+		struct on_connect_t : public Event::event_t {
+			ClientSocket* client;
+
+			on_connect_t(ClientSocket* client) noexcept
+				: client(client) {}
+		};
+		struct on_data_t : public Event::event_t {
+			std::string data;
+			ClientSocket* client;
+
+			on_data_t(const char* data, ClientSocket* client) noexcept
+				: data(data), client(client) {}
+			on_data_t(const char* data, std::size_t length, ClientSocket* client) noexcept
+				: data(data, length), client(client) {}
+			on_data_t(std::string data, ClientSocket* client) noexcept
+				: data(data), client(client) {}
+		};
 
 	public:
 		bool Listen(const std::string_view& host, std::uint32_t port) noexcept;
-			
-		void Accept() noexcept;
+		bool Send(const std::string_view& data, ClientSocket* sock) noexcept;
 
 		Event::Event<on_listening_t> OnListening;
+		Event::Event<on_connect_t> OnConnect;
+		Event::Event<on_data_t> OnData;
+	protected:
+		void OnIOCompleted(
+			IOCP::IOContext* ctx,
+			std::uint32_t bytesTransferred,
+			std::uint32_t error
+		) noexcept override;
 	private:
-		std::vector<ClientSocket> m_clients;
+		static LPFN_ACCEPTEX GetAcceptExPtr(SockType sock) noexcept;
+
+		bool Accept() noexcept;
+		bool Recv(ClientSocket* sock) noexcept;
+	private:
+		std::atomic<std::uint32_t> m_pendingAccepts;
+		std::vector<std::unique_ptr<ClientSocket>> m_clients;
+		std::vector<std::unique_ptr<ServerContext>> m_postedCtx;
 	};
 }

@@ -3,11 +3,13 @@
 #include <Shared/os.hpp>
 #include <string>
 #include <random>
+#include <WinSock2.h>
+#include <winternl.h>
 
 namespace NSA::Shared::Utils {
     inline std::string GetLastErrorString(DWORD error) noexcept {
         if (error == 0)
-            return {}; //No error message has been recorded
+            return {}; // No error message has been recorded
 
         char* messageBuffer = nullptr;
 
@@ -24,17 +26,26 @@ namespace NSA::Shared::Utils {
             nullptr
         );
 
-        //Copy the error message into a std::string.
+        // Copy the error message into a std::string.
         std::string message(messageBuffer, size);
 
-        //Free the Win32's string's buffer.
+        // Free the Win32's string's buffer.
         LocalFree(messageBuffer);
         return message;
     }
 
+    inline ULONG GetLastErrorInternal(NTSTATUS code) noexcept {
+        return ::RtlNtStatusToDosError(code);
+    }
+    inline std::string GetLastErrorStringInternal(NTSTATUS code) noexcept {
+        return GetLastErrorString(GetLastErrorInternal(code));
+    }
     inline std::string GetLastErrorString() noexcept {
-        //Get the error message ID, if any.
+        // Get the error message ID, if any.
         return GetLastErrorString(::GetLastError());
+    }
+    inline std::string GetLastWSAErrorString(int error = ::WSAGetLastError()) noexcept {
+        return GetLastErrorString(error);
     }
 
     template <std::integral T>

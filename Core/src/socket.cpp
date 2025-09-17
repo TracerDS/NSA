@@ -12,6 +12,7 @@
 #pragma comment(lib, "ws2_32.lib")
 
 namespace NSA::Core::Socket {
+#pragma region Static member initialization
 	HANDLE Socket::gs_globalIOCP = INVALID_HANDLE_VALUE;
 	std::vector<HANDLE> Socket::gs_workers = {};
 	std::mutex Socket::gs_globalMutex;
@@ -22,15 +23,17 @@ namespace NSA::Core::Socket {
 		0x1000000000000000,
 		0xFFFFFFFFFFFFFFFE
 	);
+#pragma endregion
 
 	namespace IOCP {
 		constexpr auto DEFAULT_BUFFER_SIZE = 8 * 1024;
+
 		IOContext::IOContext() noexcept {
 			memset(&overlapped, 0, sizeof(overlapped));
 
 			buffer.resize(DEFAULT_BUFFER_SIZE);
 			wsabuf.buf = buffer.data();
-			wsabuf.len = static_cast<ULONG>(buffer.capacity());
+			wsabuf.len = static_cast<ULONG>(buffer.size());
 		}
 	}
 
@@ -66,46 +69,40 @@ namespace NSA::Core::Socket {
 			for (ULONG i = 0; i < count; i++) {
 				auto& entry = entries[i];
 
-				std::println("{} -> IO pre completed: {} bytes (0x{:X})",
-					threadId,
-					entry.dwNumberOfBytesTransferred,
-					reinterpret_cast<uintptr_t>(entry.lpOverlapped)
-				);
-
 				auto ctx = reinterpret_cast<IOCP::IOContext*>(entry.lpOverlapped);
 				if (!ctx)
 					continue;
-
-				std::println("{} -> IO completed: {} bytes ({})",
-					threadId,
-					entry.dwNumberOfBytesTransferred,
-					IOCP::ToString(ctx->operation)
-				);
-
 
 				auto* owner = reinterpret_cast<Socket*>(ctx->owner);
 				if (!owner)
 					continue;
 
 				ctx->buffer.resize(entry.dwNumberOfBytesTransferred);
+				
 				owner->OnIOCompleted(
 					ctx,
 					entry.dwNumberOfBytesTransferred,
-					GetLastError()
+					Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(entry.Internal))
 				);
 			}
 		}
 		return 0;
 	}
 
+#pragma region Socket details
+
 	Socket::Socket() noexcept
-		: m_socket(INVALID_SOCKET)
+		: m_socket(INVALID_SOCKET), m_host(""), m_port(0)
 	{
 		std::lock_guard<std::mutex> lock(gs_globalMutex);
 		if (gs_socketCount == 0) {
 			static WSAData ms_wsaData;
 			if (WSAStartup(MAKEWORD(2, 2), &ms_wsaData)) {
-				std::println(stderr, "WSAStartup failed: {}", Shared::Utils::GetLastErrorString());
+				std::println(
+					stderr,
+					"WSAStartup failed: {}",
+					Shared::Utils::GetLastWSAErrorString()
+				);
 				return;
 			}
 			Socket::gs_globalIOCP = CreateIoCompletionPort(
@@ -127,7 +124,6 @@ namespace NSA::Core::Socket {
 			SYSTEM_INFO sysInfo;
 			GetSystemInfo(&sysInfo);
 			auto threadCount = sysInfo.dwNumberOfProcessors;
-			threadCount = 1;
 
 			for (DWORD i = 0; i < threadCount * 2; i++) {
 				HANDLE thread = CreateThread(
@@ -178,6 +174,20 @@ namespace NSA::Core::Socket {
 			std::println(
 				stderr,
 				"WSASocketW error: {}",
+				Shared::Utils::GetLastWSAErrorString()
+			);
+#endif
+			return false;
+		}
+
+		if (!SetFileCompletionNotificationModes(
+			reinterpret_cast<HANDLE>(m_socket),
+			FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+		)) {
+#ifdef ATS_DEBUG
+			std::println(
+				stderr,
+				"SetFileCompletionNotificationModes error: {}",
 				Shared::Utils::GetLastErrorString()
 			);
 #endif
@@ -200,11 +210,11 @@ namespace NSA::Core::Socket {
 		) != nullptr;
 	}
 
-	Socket::Socket(SockType&& socket) noexcept {
+	Socket::Socket(SockType&& socket) noexcept : m_host(""), m_port(0) {
 		std::swap(m_socket, socket);
 	}
 
-	Socket::Socket(Socket&& socket) noexcept {
+	Socket::Socket(Socket&& socket) noexcept : m_host(""), m_port(0) {
 		std::swap(m_socket, socket.m_socket);
 	}
 
@@ -267,11 +277,67 @@ namespace NSA::Core::Socket {
 
 	bool Socket::IsOpen() const noexcept { return m_socket != INVALID_SOCKET; }
 
+	std::optional<std::pair<std::string, std::uint32_t>> Socket::GetSocketAddress(
+		SockType sock
+	) noexcept {
+		sockaddr_in peerAddr;
+		int addrLen = sizeof(peerAddr);
+
+		if (getpeername(
+			sock,
+			reinterpret_cast<sockaddr*>(&peerAddr),
+			&addrLen
+		) == SOCKET_ERROR) {
+#ifdef ATS_DEBUG
+			auto wsaErr = WSAGetLastError();
+			std::println(
+				stderr,
+				"getpeername failed: {} ({})",
+				Shared::Utils::GetLastWSAErrorString(wsaErr),
+				wsaErr
+			);
+#endif
+			return std::nullopt;
+		}
+
+		char host[NI_MAXHOST];
+		char service[NI_MAXSERV];
+
+		if (getnameinfo(
+			reinterpret_cast<sockaddr*>(&peerAddr),
+			addrLen,
+			host,
+			sizeof(host),
+			service,
+			sizeof(service),
+			NI_NUMERICHOST | NI_NUMERICSERV
+		) == SOCKET_ERROR) {
+#ifdef ATS_DEBUG
+			std::println(
+				stderr,
+				"getnameinfo failed: {}",
+				Shared::Utils::GetLastWSAErrorString()
+			);
+#endif
+			return std::nullopt;
+		}
+
+		auto port = Shared::Utils::StringToInt<std::uint32_t>(service);
+		if (!port.has_value()) {
+#ifdef ATS_DEBUG
+			std::println(stderr, "Port is not a valid number");
+#endif
+			return std::nullopt;
+		}
+
+		return std::pair{ host, port.value() };
+	}
+
 	void swap(Socket& lhs, Socket& rhs) noexcept {
 		std::swap(lhs.m_socket, rhs.m_socket);
 	}
 
-	void* Socket::GetWinsockFunctionPtr(SOCKET sock, GUID guid) noexcept {
+	void* Socket::GetWinsockFunctionPtr(SockType sock, GUID guid) noexcept {
 		void* func = nullptr;
 
 		DWORD bytes = 0;
@@ -291,94 +357,23 @@ namespace NSA::Core::Socket {
 		return func;
 	}
 
-	LPFN_CONNECTEX Socket::GetConnectExPtr(SOCKET sock) noexcept {
+	LPFN_CONNECTEX ClientSocket::GetConnectExPtr(SockType sock) noexcept {
 		static auto func = reinterpret_cast<LPFN_CONNECTEX>(
 			GetWinsockFunctionPtr(sock, WSAID_CONNECTEX)
 		);
 		return func;
 	}
-	LPFN_ACCEPTEX Socket::GetAcceptExPtr(SOCKET sock) noexcept {
+	LPFN_ACCEPTEX ServerSocket::GetAcceptExPtr(SockType sock) noexcept {
 		static auto func = reinterpret_cast<LPFN_ACCEPTEX>(
 			GetWinsockFunctionPtr(sock, WSAID_ACCEPTEX)
 		);
 		return func;
 	}
 
-	bool Socket::PostSend(std::unique_ptr<IOCP::IOContext>& ctx, std::string_view data) noexcept {
-		if (m_socket == INVALID_SOCKET)
-			return false;
+#pragma endregion
 
-		ctx->buffer.assign(data.begin(), data.end());
-		ctx->wsabuf.buf = ctx->buffer.data();
-		ctx->wsabuf.len = static_cast<ULONG>(ctx->buffer.size());
-		ctx->operation = IOCP::IOOperation::SEND;
+#pragma region Client Socket
 
-		DWORD bytesSent = 0;
-		if (WSASend(
-			m_socket,
-			&ctx->wsabuf,
-			1,
-			&bytesSent,
-			0,
-			&ctx->overlapped,
-			nullptr
-		) == SOCKET_ERROR) {
-			auto err = WSAGetLastError();
-			if (err != WSA_IO_PENDING) {
-#ifdef ATS_DEBUG
-				std::println(
-					stderr,
-					"WSASend failed: {}",
-					Shared::Utils::GetLastErrorString(err)
-				);
-#endif
-				return false;
-			}
-		} else {
-			std::println("WSASend completed immediately: {} bytes", bytesSent);
-		}
-		return true;
-	}
-
-	bool Socket::PostRecv(std::unique_ptr<IOCP::IOContext>& ctx) noexcept {
-		if (m_socket == INVALID_SOCKET)
-			return false;
-
-		ctx->buffer.resize(IOCP::DEFAULT_BUFFER_SIZE);
-		ctx->wsabuf.buf = ctx->buffer.data();
-		ctx->wsabuf.len = static_cast<ULONG>(ctx->buffer.size());
-		ctx->operation = IOCP::IOOperation::RECV;
-
-		DWORD flags = 0;
-		DWORD bytesReceived = 0;
-		if (WSARecv(
-			m_socket,
-			&ctx->wsabuf,
-			1,
-			&bytesReceived,
-			&flags,
-			&ctx->overlapped,
-			nullptr
-		) == SOCKET_ERROR) {
-			auto err = WSAGetLastError();
-			if (err != WSA_IO_PENDING) {
-#ifdef ATS_DEBUG
-				std::println(
-					stderr,
-					"WSARecv failed: {}",
-					Shared::Utils::GetLastErrorString(err)
-				);
-#endif
-				return false;
-			}
-		} else {
-			std::println("WSARecv completed immediately: {} bytes", bytesReceived);
-		}
-		return true;
-	}
-
-	// ClientSocket
-		
 	ClientSocket::ClientSocket() noexcept : Socket() {}
 
 	ClientSocket::ClientSocket(Socket::SockType&& socket) noexcept : Socket() {
@@ -441,7 +436,7 @@ namespace NSA::Core::Socket {
 				continue;
 			}
 
-			LPFN_CONNECTEX ConnectEx = Socket::GetConnectExPtr(m_socket);
+			auto ConnectEx = ClientSocket::GetConnectExPtr(m_socket);
 			if (!ConnectEx) {
 #ifdef ATS_DEBUG
 				std::println(
@@ -453,10 +448,10 @@ namespace NSA::Core::Socket {
 				continue;
 			}
 
-			auto& ctx = m_postedCtx.emplace_back(new IOCP::IOContext());
+			auto& ctx = m_postedCtx.emplace_back(new ClientContext);
 			ctx->operation = IOCP::IOOperation::CONNECT;
 			ctx->owner = this;
-			
+
 			// Silence the C6387 warning
 			DWORD bytesSent = 0;
 			if (!ConnectEx(
@@ -484,34 +479,103 @@ namespace NSA::Core::Socket {
 			break;
 		}
 		freeaddrinfo(result);
-
 		return success;
 	}
 
-	bool ClientSocket::Send(const std::string_view& data) noexcept {
-		auto& ctx = m_postedCtx.emplace_back(new IOCP::IOContext());
-		ctx->owner = this;		
-		return PostSend(ctx, data);
-	}
-
-	bool ClientSocket::Recv(Event::Event<on_data_t> callback) noexcept {
-		OnData = callback;
-		return Recv();
-	}
-
 	bool ClientSocket::Recv() noexcept {
-		auto& ctx = m_postedCtx.emplace_back(new IOCP::IOContext());
+		if (m_socket == INVALID_SOCKET)
+			return false;
+
+		auto& ctx = m_postedCtx.emplace_back(new ClientContext);
 		ctx->owner = this;
-		return PostRecv(ctx);
+		ctx->buffer.resize(IOCP::DEFAULT_BUFFER_SIZE);
+		ctx->wsabuf.buf = ctx->buffer.data();
+		ctx->wsabuf.len = static_cast<ULONG>(ctx->buffer.size());
+		ctx->operation = IOCP::IOOperation::RECV;
+
+		DWORD flags = 0;
+		DWORD bytesReceived = 0;
+		if (WSARecv(
+			m_socket,
+			&ctx->wsabuf,
+			1,
+			&bytesReceived,
+			&flags,
+			&ctx->overlapped,
+			nullptr
+		) == SOCKET_ERROR) {
+			auto err = WSAGetLastError();
+			if (err != WSA_IO_PENDING) {
+#ifdef ATS_DEBUG
+				std::println(
+					stderr,
+					"WSARecv failed: {}",
+					Shared::Utils::GetLastWSAErrorString(err)
+				);
+#endif
+				return false;
+			}
+		} else {
+			this->OnIOCompleted(
+				ctx.get(),
+				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
+			);
+		}
+		return true;
+	}
+
+	bool ClientSocket::Send(const std::string_view& data) noexcept {
+		if (m_socket == INVALID_SOCKET)
+			return false;
+
+		auto& ctx = m_postedCtx.emplace_back(new ClientContext);
+		ctx->owner = this;
+		ctx->buffer.assign(data.begin(), data.end());
+		ctx->wsabuf.buf = ctx->buffer.data();
+		ctx->wsabuf.len = static_cast<ULONG>(ctx->buffer.size());
+		ctx->operation = IOCP::IOOperation::SEND;
+
+		DWORD bytesSent = 0;
+		if (WSASend(
+			m_socket,
+			&ctx->wsabuf,
+			1,
+			&bytesSent,
+			0,
+			&ctx->overlapped,
+			nullptr
+		) == SOCKET_ERROR) {
+			auto err = WSAGetLastError();
+			if (err != WSA_IO_PENDING) {
+#ifdef ATS_DEBUG
+				std::println(
+					stderr,
+					"WSASend failed: {}",
+					Shared::Utils::GetLastWSAErrorString(err)
+				);
+#endif
+				return false;
+			}
+		} else {
+			this->OnIOCompleted(
+				ctx.get(),
+				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
+			);
+		}
+		return true;
 	}
 
 	void ClientSocket::OnIOCompleted(
-		IOCP::IOContext* ctx,
+		IOCP::IOContext* rawCtx,
 		std::uint32_t bytesTransferred,
 		std::uint32_t error
 	) noexcept {
-		if (!ctx)
+		if (!rawCtx)
 			return;
+
+		auto ctx = static_cast<ClientContext*>(rawCtx);
 
 		switch (ctx->operation) {
 			case IOCP::IOOperation::CONNECT: {
@@ -520,7 +584,7 @@ namespace NSA::Core::Socket {
 					std::println(
 						stderr,
 						"Connect failed: {}",
-						Shared::Utils::GetLastErrorString(error)
+						Shared::Utils::GetLastWSAErrorString(error)
 					);
 #endif
 					break;
@@ -539,59 +603,23 @@ namespace NSA::Core::Socket {
 					std::println(
 						stderr,
 						"OnIOCompleted error: {}",
-						Shared::Utils::GetLastErrorString()
-					);
-#endif
-					break;
-				}
-				sockaddr_in peerAddr;
-				int addrLen = sizeof(peerAddr);
-
-				if (getpeername(
-					m_socket,
-					reinterpret_cast<sockaddr*>(&peerAddr),
-					&addrLen
-				) == SOCKET_ERROR) {
-#ifdef ATS_DEBUG
-					std::println(
-						stderr,
-						"getpeername failed: {}",
-						Shared::Utils::GetLastErrorString()
+						Shared::Utils::GetLastWSAErrorString()
 					);
 #endif
 					break;
 				}
 
-				char host[NI_MAXHOST];
-				char service[NI_MAXSERV];
-
-				if (getnameinfo(
-					reinterpret_cast<sockaddr*>(&peerAddr),
-					addrLen,
-					host,
-					sizeof(host),
-					service,
-					sizeof(service),
-					NI_NUMERICHOST | NI_NUMERICSERV
-				) == SOCKET_ERROR) {
-#ifdef ATS_DEBUG
-					std::println(
-						stderr,
-						"getnameinfo failed: {}",
-						Shared::Utils::GetLastErrorString()
-					);
-#endif
+				auto addr = Socket::GetSocketAddress(m_socket);
+				if (!addr.has_value())
 					break;
-				}
-				auto port = Shared::Utils::StringToInt<std::uint32_t>(service);
-				if (!port.has_value()) {
-#ifdef ATS_DEBUG
-					std::println(stderr, "Port is not a valid number");
-#endif
-					break;
-				}
 
-				OnConnect({ host, port.value() });
+				m_host = addr.value().first;
+				m_port = addr.value().second;
+
+				OnConnect({ m_host, m_port });
+
+				for (auto i = 0; i < Socket::MAX_PENDING_RECVS; i++)
+					this->Recv();
 
 				break;
 			} case IOCP::IOOperation::RECV: {
@@ -601,7 +629,7 @@ namespace NSA::Core::Socket {
 					std::println(
 						stderr,
 						"ClientSocket WSARecv closed or error: {}",
-						Shared::Utils::GetLastErrorString(error)
+						Shared::Utils::GetLastWSAErrorString(error)
 					);
 #endif
 					this->Close();
@@ -611,6 +639,9 @@ namespace NSA::Core::Socket {
 				if (bytesTransferred > 0) {
 					OnData({ ctx->buffer.data(), bytesTransferred });
 				}
+				
+				this->Recv();
+
 				break;
 			} case IOCP::IOOperation::SEND: {
 				if (error != 0) {
@@ -619,7 +650,7 @@ namespace NSA::Core::Socket {
 					std::println(
 						stderr,
 						"ClientSocket WSASend closed or error: {}",
-						Shared::Utils::GetLastErrorString(error)
+						Shared::Utils::GetLastWSAErrorString(error)
 					);
 #endif
 					this->Close();
@@ -629,69 +660,280 @@ namespace NSA::Core::Socket {
 				break;
 			}
 		}
-		std::erase_if(m_postedCtx, [ctx](const auto& item) { return item.get() == ctx; });
+
+		std::erase_if(m_postedCtx, [&](auto& p) { return p.get() == ctx; });
 	}
 
-	// ServerSocket
+#pragma endregion
+
+#pragma region Server Socket
+
 	bool ServerSocket::Listen(const std::string_view& host, std::uint32_t port) noexcept {
-		addrinfo hints{};
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_protocol = IPPROTO_TCP;
+		if (m_socket == INVALID_SOCKET)
+			return false;
 
-		addrinfo* result = nullptr;
-		auto portStr = std::to_string(port);
+		sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(port);
+		if (inet_pton(addr.sin_family, host.data(), &addr.sin_addr) != 1) {
+#ifdef ATS_DEBUG
+			std::println(stderr,
+				"inet_pton failed: {}",
+				Shared::Utils::GetLastWSAErrorString()
+			);
+#endif
+			return false;
+		}
+		if (bind(m_socket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+#ifdef ATS_DEBUG
+			std::println(stderr,
+				"bind failed: {}",
+				Shared::Utils::GetLastWSAErrorString()
+			);
+#endif
+			return false;
+		}
 
-		{
-			auto ret = getaddrinfo(host.data(), portStr.c_str(), &hints, &result);
-			if (ret != 0) {
+		if (listen(m_socket, SOMAXCONN) == SOCKET_ERROR) {
+#ifdef ATS_DEBUG
+			std::println(stderr,
+				"listen failed: {}",
+				Shared::Utils::GetLastWSAErrorString()
+			);
+#endif
+			return false;
+		}
+
+		m_host = host;
+		m_port = port;
+		OnListening({ host, port });
+
+		for (auto i = 0; i < gs_workers.size(); i++) {
+			this->Accept();
+		}
+		return true;
+	}
+
+	bool ServerSocket::Accept() noexcept {
+		if (m_socket == INVALID_SOCKET)
+			return false;
+
+		auto AcceptEx = ServerSocket::GetAcceptExPtr(m_socket);
+		if (!AcceptEx) {
+#ifdef ATS_DEBUG
+			std::println(
+				stderr,
+				"GetAcceptExPtr failed: {}",
+				Shared::Utils::GetLastErrorString()
+			);
+#endif
+			return false;
+		}
+
+		auto& ctx = m_postedCtx.emplace_back(new ServerContext);
+		ctx->owner = this;
+
+		auto& sock = m_clients.emplace_back(new ClientSocket);
+		if (!sock->Create())
+			return false;
+
+		ctx->client = sock.get();
+		ctx->operation = IOCP::IOOperation::ACCEPT;
+		DWORD bytesReceived = 0;
+
+		if (!AcceptEx(
+			m_socket,
+			ctx->client->GetSocket(),
+			ctx->buffer.data(),
+			0,
+			sizeof(sockaddr_storage) + 16,
+			sizeof(sockaddr_storage) + 16,
+			&bytesReceived,
+			&ctx->overlapped
+		)) {
+			auto err = WSAGetLastError();
+			if (err != WSA_IO_PENDING) {
 #ifdef ATS_DEBUG
 				std::println(
 					stderr,
-					"getaddrinfo failed: {}",
-					Shared::Utils::GetLastErrorString(ret)
+					"ConnectEx failed: {}",
+					Shared::Utils::GetLastErrorString(err)
 				);
 #endif
 				return false;
 			}
+		} else {
+			this->OnIOCompleted(
+				ctx.get(),
+				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh),
+				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
+			);
 		}
+		return true;
+	}
 
-		bool success = false;
-		for (auto ai = result; ai; ai = ai->ai_next) {
-			sockaddr_storage ss;
-			ZeroMemory(&ss, sizeof(ss));
+	bool ServerSocket::Send(const std::string_view& data, ClientSocket* sock) noexcept {
+		if (m_socket == INVALID_SOCKET)
+			return false;
 
-			int aiSize = 0;
+		auto& ctx = m_postedCtx.emplace_back(new ServerContext);
+		ctx->owner = this;
+		ctx->client = sock;
+		ctx->buffer.assign(data.begin(), data.end());
+		ctx->wsabuf.buf = ctx->buffer.data();
+		ctx->wsabuf.len = static_cast<ULONG>(ctx->buffer.size());
+		ctx->operation = IOCP::IOOperation::SEND;
 
-			if (ai->ai_family == AF_INET) {
-				sockaddr_in* sin = (sockaddr_in*)&ss;
-				sin->sin_family = AF_INET;
-				aiSize = sizeof(sockaddr_in);
-			} else {
-				sockaddr_in6* sin6 = (sockaddr_in6*)&ss;
-				sin6->sin6_family = AF_INET6;
-				aiSize = sizeof(sockaddr_in6);
-			}
-
-			if (bind(
-				m_socket,
-				reinterpret_cast<sockaddr*>(&ss),
-				aiSize
-			) == SOCKET_ERROR) {
+		DWORD bytesSent = 0;
+		if (WSASend(
+			ctx->client->GetSocket(),
+			&ctx->wsabuf,
+			1,
+			&bytesSent,
+			0,
+			&ctx->overlapped,
+			nullptr
+		) == SOCKET_ERROR) {
+			auto err = WSAGetLastError();
+			if (err != WSA_IO_PENDING) {
 #ifdef ATS_DEBUG
 				std::println(
 					stderr,
-					"bind failed: {}",
-					Shared::Utils::GetLastErrorString()
+					"WSASend failed: {}",
+					Shared::Utils::GetLastWSAErrorString(err)
 				);
 #endif
-				continue;
+				return false;
 			}
+		} else {
+			this->OnIOCompleted(
+				ctx.get(),
+				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
+			);
 		}
-		freeaddrinfo(result);
-		return success;
+		return true;
 	}
 
-	void ServerSocket::Accept() noexcept {
+	bool ServerSocket::Recv(ClientSocket* sock) noexcept {
+		if (m_socket == INVALID_SOCKET)
+			return false;
+
+		auto& ctx = m_postedCtx.emplace_back(new ServerContext);
+		ctx->owner = this;
+		ctx->client = sock;
+		ctx->buffer.resize(IOCP::DEFAULT_BUFFER_SIZE);
+		ctx->wsabuf.buf = ctx->buffer.data();
+		ctx->wsabuf.len = static_cast<ULONG>(ctx->buffer.size());
+		ctx->operation = IOCP::IOOperation::RECV;
+
+		DWORD flags = 0;
+		DWORD bytesReceived = 0;
+		if (WSARecv(
+			ctx->client->GetSocket(),
+			&ctx->wsabuf,
+			1,
+			&bytesReceived,
+			&flags,
+			&ctx->overlapped,
+			nullptr
+		) == SOCKET_ERROR) {
+			auto err = WSAGetLastError();
+			if (err != WSA_IO_PENDING) {
+#ifdef ATS_DEBUG
+				std::println(
+					stderr,
+					"WSARecv failed: {}",
+					Shared::Utils::GetLastWSAErrorString(err)
+				);
+#endif
+				return false;
+			}
+		} else {
+			this->OnIOCompleted(
+				ctx.get(),
+				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
+			);
+		}
+		return true;
 	}
+
+	void ServerSocket::OnIOCompleted(
+		IOCP::IOContext* rawCtx,
+		std::uint32_t bytesTransferred,
+		std::uint32_t error
+	) noexcept {
+		if (!rawCtx)
+			return;
+
+		auto ctx = static_cast<ServerContext*>(rawCtx);
+
+		switch (ctx->operation) {
+			case IOCP::IOOperation::ACCEPT: {
+				if (error != 0) {
+					// connection closed or error
+#ifdef ATS_DEBUG
+					std::println(
+						stderr,
+						"ServerSocket AcceptEx closed or error: {}",
+						Shared::Utils::GetLastWSAErrorString(error)
+					);
+#endif
+					this->Close();
+					break;
+				}
+
+				OnConnect({ ctx->client });
+
+				for (auto i = 0; i < Socket::MAX_PENDING_RECVS; i++)
+					this->Recv(ctx->client);
+
+				break;
+			} case IOCP::IOOperation::RECV: {
+				if (error != 0) {
+					// connection closed or error
+#ifdef ATS_DEBUG
+					std::println(
+						stderr,
+						"ServerSocket WSARecv closed or error: {}",
+						Shared::Utils::GetLastWSAErrorString(error)
+					);
+#endif
+					this->Close();
+					break;
+				}
+
+				if (bytesTransferred > 0) {
+					OnData({ ctx->buffer.data(), bytesTransferred, ctx->client });
+				}
+
+				if (!this->Recv(ctx->client)) {
+					ctx->client->Close();
+				}
+
+				break;
+			} case IOCP::IOOperation::SEND: {
+				if (error != 0) {
+					// connection closed or error
+#ifdef ATS_DEBUG
+					std::println(
+						stderr,
+						"ServerSocket WSASend closed or error: {}",
+						Shared::Utils::GetLastWSAErrorString(error)
+					);
+#endif
+					this->Close();
+					break;
+				}
+
+				break;
+			}
+		}
+
+		std::erase_if(m_postedCtx, [&](auto& p) { return p.get() == ctx; });
+	}
+
+#pragma endregion
+
 }
