@@ -102,6 +102,7 @@ namespace NSA::Core::Socket {
 		SockType m_socket;
 		std::string m_host;
 		std::uint32_t m_port;
+		static std::mutex gs_bufferMutex;
 	private:
 		static HANDLE gs_globalIOCP;
 		static std::mutex gs_globalMutex;

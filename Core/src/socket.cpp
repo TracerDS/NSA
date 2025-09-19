@@ -16,6 +16,7 @@ namespace NSA::Core::Socket {
 	HANDLE Socket::gs_globalIOCP = INVALID_HANDLE_VALUE;
 	std::vector<HANDLE> Socket::gs_workers = {};
 	std::mutex Socket::gs_globalMutex;
+	std::mutex Socket::gs_bufferMutex;
 	std::atomic<std::uint32_t> Socket::gs_socketCount = 0;
 	std::atomic<bool> Socket::gs_workersRunning = false;
 	const auto Socket::gs_shutdownKey = Shared::Utils::RandomInRange<std::uint64_t>
@@ -67,19 +68,17 @@ namespace NSA::Core::Socket {
 				continue;
 			}
 			for (ULONG i = 0; i < count; i++) {
+				std::lock_guard<std::mutex> lock(Socket::gs_bufferMutex);
+
 				auto& entry = entries[i];
 
 				auto ctx = reinterpret_cast<IOCP::IOContext*>(entry.lpOverlapped);
 				if (!ctx)
 					continue;
 
-				auto* owner = reinterpret_cast<Socket*>(ctx->owner);
-				if (!owner)
-					continue;
-
 				ctx->buffer.resize(entry.dwNumberOfBytesTransferred);
 				
-				owner->OnIOCompleted(
+				ctx->owner->OnIOCompleted(
 					ctx,
 					entry.dwNumberOfBytesTransferred,
 					Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(entry.Internal))
@@ -486,6 +485,8 @@ namespace NSA::Core::Socket {
 		if (m_socket == INVALID_SOCKET)
 			return false;
 
+		std::lock_guard<std::mutex> lock(gs_bufferMutex);
+
 		auto& ctx = m_postedCtx.emplace_back(new ClientContext);
 		ctx->owner = this;
 		ctx->buffer.resize(IOCP::DEFAULT_BUFFER_SIZE);
@@ -516,9 +517,12 @@ namespace NSA::Core::Socket {
 				return false;
 			}
 		} else {
+			auto bytesTransferred = static_cast<std::uint32_t>(ctx->overlapped.InternalHigh);
+			ctx->buffer.resize(bytesTransferred);
+
 			this->OnIOCompleted(
 				ctx.get(),
-				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				bytesTransferred,
 				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
 			);
 		}
@@ -528,6 +532,8 @@ namespace NSA::Core::Socket {
 	bool ClientSocket::Send(const std::string_view& data) noexcept {
 		if (m_socket == INVALID_SOCKET)
 			return false;
+
+		std::lock_guard<std::mutex> lock(gs_bufferMutex);
 
 		auto& ctx = m_postedCtx.emplace_back(new ClientContext);
 		ctx->owner = this;
@@ -558,9 +564,12 @@ namespace NSA::Core::Socket {
 				return false;
 			}
 		} else {
+			auto bytesTransferred = static_cast<std::uint32_t>(ctx->overlapped.InternalHigh);
+			ctx->buffer.resize(bytesTransferred);
+
 			this->OnIOCompleted(
 				ctx.get(),
-				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				bytesTransferred,
 				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
 			);
 		}
@@ -730,6 +739,8 @@ namespace NSA::Core::Socket {
 			return false;
 		}
 
+		std::lock_guard<std::mutex> lock(gs_bufferMutex);
+
 		auto& ctx = m_postedCtx.emplace_back(new ServerContext);
 		ctx->owner = this;
 
@@ -763,9 +774,12 @@ namespace NSA::Core::Socket {
 				return false;
 			}
 		} else {
+			auto bytesTransferred = static_cast<std::uint32_t>(ctx->overlapped.InternalHigh);
+			ctx->buffer.resize(bytesTransferred);
+
 			this->OnIOCompleted(
 				ctx.get(),
-				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh),
+				bytesTransferred,
 				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
 			);
 		}
@@ -775,6 +789,8 @@ namespace NSA::Core::Socket {
 	bool ServerSocket::Send(const std::string_view& data, ClientSocket* sock) noexcept {
 		if (m_socket == INVALID_SOCKET)
 			return false;
+
+		std::lock_guard<std::mutex> lock(gs_bufferMutex);
 
 		auto& ctx = m_postedCtx.emplace_back(new ServerContext);
 		ctx->owner = this;
@@ -806,9 +822,12 @@ namespace NSA::Core::Socket {
 				return false;
 			}
 		} else {
+			auto bytesTransferred = static_cast<std::uint32_t>(ctx->overlapped.InternalHigh);
+			ctx->buffer.resize(bytesTransferred);
+
 			this->OnIOCompleted(
 				ctx.get(),
-				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				bytesTransferred,
 				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
 			);
 		}
@@ -818,6 +837,8 @@ namespace NSA::Core::Socket {
 	bool ServerSocket::Recv(ClientSocket* sock) noexcept {
 		if (m_socket == INVALID_SOCKET)
 			return false;
+
+		std::lock_guard<std::mutex> lock(gs_bufferMutex);
 
 		auto& ctx = m_postedCtx.emplace_back(new ServerContext);
 		ctx->owner = this;
@@ -850,9 +871,12 @@ namespace NSA::Core::Socket {
 				return false;
 			}
 		} else {
+			auto bytesTransferred = static_cast<std::uint32_t>(ctx->overlapped.InternalHigh);
+			ctx->buffer.resize(bytesTransferred);
+
 			this->OnIOCompleted(
 				ctx.get(),
-				static_cast<std::uint32_t>(ctx->overlapped.InternalHigh), // bytes transferred
+				bytesTransferred,
 				Shared::Utils::GetLastErrorInternal(static_cast<NTSTATUS>(ctx->overlapped.Internal))
 			);
 		}
